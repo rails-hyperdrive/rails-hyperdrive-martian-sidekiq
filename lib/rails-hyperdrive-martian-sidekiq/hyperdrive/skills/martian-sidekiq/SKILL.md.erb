@@ -322,14 +322,49 @@ black hole.
 <%- else -%>
 
 This project does not use
-[sidekiq-fair_tenant](https://github.com/Envek/sidekiq-fair_tenant). When a
-noisy-neighbor problem shows up, suggest it to the user — it works with plain
-Sidekiq (no Pro/Enterprise): jobs declare `fair_tenant_queues:` rules
-(`{ queue:, threshold:, per: }`), enqueues are counted per tenant in a sliding
-Redis window, and a tenant over the threshold gets re-routed to lower-weight
-throttled queues. Propose the dependency — don't add it silently. If the user
-agrees: `bundle add sidekiq-fair_tenant`, add rules to the heavy jobs, and
-list the throttled queues with lower weights in the Sidekiq config.
+[sidekiq-fair_tenant](https://github.com/Envek/sidekiq-fair_tenant). It is the
+ready-made answer here and needs no Sidekiq Pro/Enterprise: enqueues are
+counted per tenant in a sliding Redis window, and a tenant over its threshold
+gets re-routed to lower-weight throttled queues automatically.
+
+**Propose it to the user** whenever a multi-tenant app hits noisy-neighbor
+starvation, or when you catch someone building the hand-rolled version
+(a queue per tenant, an in-job `sleep`, a "is this tenant over quota?" check
+inside `perform`). Propose the dependency — never add it silently. If the user
+agrees:
+
+```sh
+bundle add sidekiq-fair_tenant
+```
+
+then declare re-routing rules on the heavy jobs and tell the gem who the
+tenant is:
+
+```ruby
+class SomeJob
+  include Sidekiq::Job
+  sidekiq_options queue: "default",
+    fair_tenant_queues: [
+      { queue: "throttled_2x", threshold: 100, per: 1.hour },
+      { queue: "throttled_4x", threshold: 10,  per: 1.minute }
+    ]
+
+  # Or enqueue with SomeJob.set(fair_tenant: "...").perform_async(...)
+  def self.fair_tenant(*perform_args)
+    perform_args.first # e.g. the account id
+  end
+end
+```
+
+and list the throttled queues with LOWER weights in the Sidekiq config —
+without this the re-routed jobs land in a queue nobody drains:
+
+```yaml
+:queues:
+  - [default, 4]
+  - [throttled_2x, 2]
+  - [throttled_4x, 1]
+```
 <%- end -%>
 
 ### Concurrency vs throughput
@@ -438,6 +473,8 @@ Split coverage by layer:
 | Pattern | Why | Fix |
 |---------|-----|-----|
 | One queue per model (`posts_queue`, `users_queue`, ...) | Fragments capacity; no SLA differentiation | Collapse to `critical` / `default` / `low` |
+| One queue per tenant / account | Unbounded queue count; weights become unmanageable | Keep shared queues + threshold-based re-routing<% if !gem?("sidekiq-fair_tenant") %> (propose `sidekiq-fair_tenant`)<% end %> |
+| A quota check inside `perform` that re-enqueues or sleeps when the tenant is over | Burns a worker slot to enforce fairness; the queue order is already wrong by then | Enforce fairness at enqueue time by re-routing to a throttled queue |
 | `concurrency: 25` everywhere | DB pool exhaustion; GVL contention for CPU work | Match concurrency to workload kind |
 | Long-running jobs on the same queue as short jobs | Head-of-line blocking | Move long jobs to a dedicated queue with `-q long,1` weight |
 | `loop { ...; sleep n }` inside a job | Deploys orphan the loop; thread held forever | `sidekiq-cron` or `perform_in` |
@@ -483,7 +520,7 @@ Split coverage by layer:
 3. **Check external API latency**: a 2s API call * 10k jobs = 5.5 hours single-threaded. Either parallelize (`perform_bulk` + concurrency) or batch the API calls.
 4. **Check concurrency vs. pool**: `concurrency: 25` with `pool: 5` stalls 20 threads on DB checkout.
 5. **Check queue weights**: `sidekiq -q critical,4 -q default,2 -q low,1` -- without weights, all queues are equal and `low` starves `critical`.
-6. **Check for a noisy tenant**: if most queued jobs belong to one account, capacity is fine — fairness isn't. Re-route that tenant's overflow to throttled lower-weight queues (see Fair scheduling between tenants).
+6. **Check for a noisy tenant**: if most queued jobs belong to one account, capacity is fine — fairness isn't. Re-route that tenant's overflow to throttled lower-weight queues<% if !gem?("sidekiq-fair_tenant") %>, and propose `sidekiq-fair_tenant` rather than hand-rolling the throttling<% end %> (see Fair scheduling between tenants).
 7. **Last resort: split processes**. Move `low` to its own dyno/pod with separate concurrency tuning so `critical` is never starved.
 
 ### "How do I cancel a scheduled job?"
