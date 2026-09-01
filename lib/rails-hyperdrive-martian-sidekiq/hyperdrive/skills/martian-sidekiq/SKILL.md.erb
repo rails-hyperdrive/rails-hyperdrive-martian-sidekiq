@@ -286,7 +286,29 @@ Pick one of four fixes, in increasing order of machinery:
    to the user — it makes `after_commit` / `after_rollback` callable from
    service objects, and running outside a transaction simply executes the
    block immediately, so the service stays correct whether or not a caller
-   wrapped it. Propose the dependency; don't add it silently.
+   wrapped it. Propose the dependency; don't add it silently. If the user
+   agrees:
+
+   ```sh
+   bundle add after_commit_everywhere
+   ```
+
+   then move the enqueue into the service:
+
+   ```ruby
+   class ChargeInvoice
+     include AfterCommitEverywhere
+
+     def call(user:, amount:)
+       invoice = Invoice.create!(user:, amount:)
+       after_commit { ChargeInvoiceJob.perform_async(invoice.id) }
+       invoice
+     end
+   end
+   ```
+
+   Don't call the methods on an AR model directly — that registers the
+   callback on every instance, including future ones.
 <%- end -%>
 
 4. **Use a transactional outbox** (e.g. [sidekiq-grouping](https://github.com/gzigzigzeo/sidekiq-grouping), `acidic_job`, or a hand-rolled `outbox_events` table polled by a worker). Required when you need exactly-once-ish semantics across the DB and Redis. Most apps don't need this; the first three suffice.
@@ -335,8 +357,22 @@ When neither DB option fits and the lock genuinely belongs in Redis, propose
 [`sidekiq-unique-jobs`](https://github.com/mhenrixon/sidekiq-unique-jobs) to
 the user — it is the de-facto standard for uniqueness locks on OSS Sidekiq
 (uniqueness itself is an Enterprise feature). Propose the dependency; don't
-add it silently, and check the version constraint first: current releases
-require Sidekiq >= 8, so a Sidekiq 7.x app needs the gem's 8.x line.
+add it silently. If the user agrees:
+
+```sh
+bundle add sidekiq-unique-jobs
+```
+
+The stable 8.x line supports Sidekiq 7 and 8, so this resolves without a
+version pin. Its README documents Sidekiq >= 8 — that is the unreleased 9.0
+line; don't pin to a prerelease on its account.
+
+then declare the lock on the job, always with a TTL so a worker killed
+mid-job cannot block its subject forever:
+
+```ruby
+sidekiq_options lock: :until_executed, lock_ttl: 30.minutes
+```
 <%- end -%>
 
 ### Queue layout: latency-based, not feature-based
