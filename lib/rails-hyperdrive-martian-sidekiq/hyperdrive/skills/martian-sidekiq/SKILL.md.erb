@@ -1,0 +1,449 @@
+---
+name: martian-sidekiq
+description: "Writing and reviewing Sidekiq jobs in Rails projects. Use when (1) creating new worker/job classes, (2) reviewing job code for retry, idempotency, or transactional bugs, (3) debugging duplicated/lost/stuck jobs, (4) tuning queue layout, concurrency, or backpressure, (5) writing or fixing tests that enqueue, drain, or assert on jobs. MUST use when working with `perform_async`, `perform_in`, `perform_bulk`, `sidekiq_options`, `retry`, `sidekiq-cron`, `sidekiq-unique-jobs`, `Sidekiq::Testing`, or transactional enqueues. Covers: Sidekiq, ActiveJob-on-Sidekiq, idempotency, retries, uniqueness, batching, rate limiting, transactional outbox, queue layout, testing, observability."
+---
+
+# Sidekiq for Rails
+
+A skill for writing idempotent, well-retried, transactionally-safe Sidekiq jobs in Rails projects.
+
+## Thinking Prompts
+
+Before writing a job, ask yourself:
+
+- "If this job runs twice with the same arguments, what breaks?" -- if anything breaks, the job is not idempotent; fix that first
+- "Could the caller's DB transaction roll back AFTER the job is enqueued?" -- if yes, you have a transactional outbox bug, see [Enqueue inside a transaction](#enqueue-inside-a-transaction)
+- "What state does this job mutate that another worker could mutate concurrently?" -- if any, you need uniqueness or row-level locking
+- "If this raises on retry attempt 25, what does the user see and what does on-call see?" -- design the failure mode, don't discover it
+- "Is this job doing real work, or just orchestrating other jobs?" -- orchestration belongs in a Batch / Workflow, not a long `perform`
+
+When reviewing existing jobs, scan for the three failure modes:
+
+- "Are arguments small, JSON-serializable, and stable?" -- AR objects, symbols, ActiveSupport::TimeWithZone in args are the #1 source of `JSON::GeneratorError` and silent argument drift
+- "Is `sidekiq_options retry:` set explicitly?" -- a missing `retry:` directive is fine (defaults to 25), but jobs that should NEVER retry (idempotency-violating, user-visible side effects) need `retry: false` or `retry: 0`
+- "Does `perform` start with an early-exit guard for the no-op case?" -- if the record was deleted, soft-deleted, or already processed, return early; don't fight to make a no-op idempotent later
+
+Then annotate jobs with `[ok]`/`[warning]`/`[error]`:
+
+- `[ok]` -- safe to retry, transactional, single responsibility
+- `[warning]` -- works today but coupled to caller state or queue config
+- `[error]` -- not idempotent, or enqueued inside a transaction that can roll back
+
+If a job's `perform` body has >3 conditional branches that ALSO trigger external side effects (HTTP, email, payments), extract each branch to its own job. The top-level job becomes a dispatcher; each child job is independently retryable.
+
+### Job kind selection
+
+| What you're doing | Job kind | Why |
+|-------------------|----------|-----|
+| Send one email / one webhook | `ActionMailer#deliver_later` / a single Sidekiq worker | One side effect = one job |
+| Process N records, each independent | `perform_bulk` enqueuing N child jobs | Each child retries independently; failure of one does not block others |
+| Fan-out + collect (N children, then aggregate) | `Sidekiq::Batch` (Pro) or per-record idempotency keys with a final "all done?" check | Naïve fan-out without coordination drops the aggregate step on partial failure |
+| Long-running orchestration with pauses | Workflow gem (Acidic Job, Sidekiq Workflows, or external) | A single `perform` that sleeps or polls is a footgun |
+| Recurring background work | `sidekiq-cron` or `sidekiq-scheduler`, never `loop { sleep }` | Server restarts kill in-process loops silently |
+| One-off scheduled work (e.g. send reminder in 7d) | `perform_in(7.days, ...)` | Survives deploys; cancel via the job id if the source record changes |
+
+### When a side effect lives in the wrong layer
+
+| Situation | Action |
+|-----------|--------|
+| `after_commit` callback enqueues a job from a model | Acceptable for low-coupling notifications; risky when the model is created in many flows -- prefer enqueuing from the service that owns the use case |
+| Controller enqueues 5 jobs in a row | Move to a single coordinator job + `perform_bulk` so the request returns fast and retries are unified |
+| Caller awaits the result of a job | Wrong shape -- either do the work synchronously or return a "processing" state and let the client poll |
+| Job calls another job's `.new.perform` inline | Loses retry isolation; either inline the logic OR enqueue with `perform_async` |
+
+## Quick Reference: Idempotency
+
+### Make every job idempotent
+
+A job MUST be safe to run >=2 times with the same arguments. Sidekiq retries by default, and at-least-once delivery is non-negotiable. Idempotency is not a nice-to-have; it is the entry criterion.
+
+| Strategy | When to use | How |
+|----------|-------------|-----|
+| Early-exit guard | Side effect is "set X to value Y" | `return if record.already_in_state?(...)` at the top of `perform` |
+| Unique constraint | Side effect is "insert row Z" | Add a DB unique index on the natural key; rescue `ActiveRecord::RecordNotUnique` and treat as success |
+| Idempotency key | Side effect is an external HTTP call (Stripe, Sendgrid, etc.) | Pass a deterministic key (job args hash, source record id + version) so the remote API dedupes |
+| Optimistic locking | Side effect is "update X based on its current value" | Use `lock_version` and rescue `StaleObjectError` -- the retry will reload and re-check |
+| Application-level dedupe | Side effect is "enqueue a notification" | Store the enqueue intent (`UNIQUE (user_id, notification_kind, day)`) before enqueuing |
+
+### Pre-merge checklist: is this job idempotent?
+
+Before merging a new job, verify ALL of these:
+- [ ] Running `perform(*same_args)` twice produces the same end state
+- [ ] No external HTTP side effect runs without an idempotency key OR a pre-check
+- [ ] No "find or create" pattern uses `first_or_create` without a unique index backing it
+- [ ] No model uses `update` on a derived counter (`count += 1`) -- use atomic `update_counters` or a SQL `UPDATE ... SET col = col + 1`
+- [ ] If the job sends an email, the recipient is the SAME record the job was enqueued for (not a "current user" looked up at run time)
+- [ ] Arguments contain IDs and primitives only -- never AR instances, Symbols, or `Time.current`
+
+### Arguments: keep them small and serializable
+
+Aim for well under 1 KB per job: arguments live in Redis for the job's whole
+lifetime (queue + retries + scheduled set), so large arguments consume Redis
+memory across millions of jobs and can cause incidents. Pass IDs and look the
+data up in `perform`; never serialize objects as arguments.
+
+| Pattern | Why it breaks | Fix |
+|---------|---------------|-----|
+| `perform_async(user)` (an AR object) | Sidekiq JSON-serializes the object's full attributes -- snapshot drifts from DB by the time the worker runs; also wastes Redis | Pass `user.id`, refetch in `perform` |
+| `perform_async(:some_symbol)` | Symbols round-trip as strings -- `case kind` branches silently fall through | Pass strings explicitly, or freeze a constants module the worker maps |
+| `perform_async(Time.current)` | Time serializes to a String with the local zone; UTC vs zoned drift bites months later | Pass an integer epoch or an ISO8601 String the worker re-parses |
+| `perform_async(some_hash_with_symbol_keys)` | Keys come back as strings; `args[:user_id]` returns nil | Use string keys, or convert with `args.with_indifferent_access` at the top of `perform` |
+| `perform_async(large_payload)` (>1 MB) | Bloats Redis, slows fetch, may exceed Redis value limit | Persist the payload (DB / S3) and pass the id |
+
+### Refetch pattern
+
+```ruby
+class ChargeInvoiceJob
+  include Sidekiq::Job
+  sidekiq_options queue: :payments, retry: 10
+
+  def perform(invoice_id)
+    invoice = Invoice.find_by(id: invoice_id)
+    return unless invoice                          # deleted between enqueue and run
+    return if invoice.charged? || invoice.void?    # idempotency guard
+    return unless invoice.ready_to_charge?         # state-machine precondition
+
+    invoice.charge!(idempotency_key: "invoice-#{invoice.id}-v#{invoice.lock_version}")
+  end
+end
+```
+
+Three guards in a row at the top of `perform` is the canonical Sidekiq shape. If you find yourself writing a fourth, the precondition belongs in a state-machine method on the model.
+
+## Quick Reference: Retries
+
+### Default retry behavior
+
+- `sidekiq_options retry: 25` (the default) -> ~21 days of exponential backoff with jitter; after that the job lands in the Dead Set for 6 months.
+- `sidekiq_options retry: false` (or `retry: 0`) -> failures go straight to the Dead Set (or are discarded with `dead: false`).
+- `sidekiq_options retry: N` -> N retries, then Dead Set.
+
+Pick a retry count that matches the worst tolerable latency. A payment confirmation that becomes useless after 10 minutes should not retry for 21 days.
+
+### Custom backoff
+
+```ruby
+class ExternalApiJob
+  include Sidekiq::Job
+  sidekiq_options retry: 8
+
+  sidekiq_retry_in do |count, exception|
+    case exception
+    when RateLimited      then count * 60          # linear backoff for 429s
+    when Net::OpenTimeout then 10 * (count ** 2)   # quadratic for transient network
+    else                       :kill                # any other error -> Dead Set immediately
+    end
+  end
+
+  def perform(...)
+    # ...
+  end
+end
+```
+
+### Don't retry on the caller's behalf
+
+| Pattern | Why | Fix |
+|---------|-----|-----|
+| `begin; do_thing; rescue; retry; end` inside `perform` | Blocks the worker thread; one bad call holds a slot for minutes | Re-raise; let Sidekiq retry the job with backoff |
+| `sleep 5; retry` for a 429 | Burns a thread on a sleep; doesn't survive worker restart | Raise a `RateLimited` exception; configure `sidekiq_retry_in` to back off |
+| `loop { break if done }` polling for an external state | Same thread cost; deploys orphan the loop | Re-enqueue the job with `perform_in(30.seconds, ...)` |
+| Retrying inside a transaction | The transaction is held open across retries; locks pile up | Move the retry boundary outside the transaction (Sidekiq's retry, not yours) |
+
+### Stop retrying when retry is pointless
+
+Some exceptions should NOT retry:
+
+- `ActiveRecord::RecordNotFound` for the primary arg -- the record was deleted; retrying 24 more times changes nothing
+- `ArgumentError` / `TypeError` / `NoMethodError` -- a code bug, the next attempt will fail the same way
+- Authorization failures (`Pundit::NotAuthorizedError`) -- state hasn't changed; retry won't fix it
+- `JSON::ParserError` on a payload arg -- the payload is malformed; retrying re-parses the same bytes
+
+```ruby
+def perform(record_id)
+  record = Record.find(record_id)
+  # ...
+rescue ActiveRecord::RecordNotFound
+  # already deleted -- treat as success, don't raise
+end
+
+# OR, if a class of error must never retry:
+sidekiq_options retry: 5
+sidekiq_retry_in do |count, exception|
+  :kill if exception.is_a?(Pundit::NotAuthorizedError)
+end
+```
+
+### Rate-limited external work: smear the schedule, then throttle
+
+For work bounded by an external rate limit (an API allowing N calls/minute),
+one mechanism is not enough — combine two:
+
+1. **Smearing** sets the coarse schedule: spread the enqueues over time with
+   `perform_in(i * interval, ...)` or `push_bulk` with `at:` timestamps instead
+   of dumping 10k jobs into the queue at once.
+<%- if gem?("sidekiq-ent") -%>
+2. **`Sidekiq::Limiter`** (Enterprise) handles fine-grained concurrency: wrap
+   the API call in a `rate` or `concurrent` limiter so bursts and retries
+   still respect the limit. Smearing alone drifts under retries; the limiter
+   alone turns the queue into a thundering herd of rescheduled jobs.
+<%- else -%>
+2. **Backoff on 429** handles the fine grain: raise a dedicated `RateLimited`
+   error when the API says no, and give it a linear `sidekiq_retry_in` backoff
+   (see Custom backoff above). Smearing alone drifts under retries; backoff
+   alone turns the queue into a thundering herd.
+<%- end -%>
+
+### Bulk enqueueing
+
+`perform_async` in a loop pays one Redis round-trip per job. For N > ~100,
+use `perform_bulk` / `Sidekiq::Client.push_bulk` — one round-trip per 1,000
+jobs, and each child job still retries independently.
+<%- if gem?("sidekiq-pro") -%>
+
+With Sidekiq Pro, enqueue inside a `batch.jobs` block: it collects all Redis
+commands and executes them via pipelining, dramatically faster than individual
+`perform_async` calls — and you get completion callbacks for free.
+<%- end -%>
+
+### `sidekiq_retries_exhausted`
+
+Use it to record a structured failure when retries are gone -- do NOT use it to swallow the failure silently.
+
+```ruby
+sidekiq_retries_exhausted do |msg, exception|
+  Bugsnag.notify(exception) { |r| r.add_metadata(:sidekiq, msg) }
+  # OPTIONAL: mark the source record as needing manual intervention
+  Invoice.find_by(id: msg["args"].first)&.mark_failed!(reason: exception.message)
+end
+```
+
+## Critical Rules
+
+### Enqueue inside a transaction
+
+If your code looks like this, you have a bug:
+
+```ruby
+# WRONG -- transactional outbox violation
+ActiveRecord::Base.transaction do
+  invoice = Invoice.create!(user:, amount:)
+  ChargeInvoiceJob.perform_async(invoice.id)   # may run BEFORE the COMMIT
+end
+```
+
+Sidekiq runs in Redis; your DB transaction has not yet committed. The worker picks up the job within milliseconds and finds `Invoice.find_by(id: ...)` returns `nil`. On retry the record exists; on bad luck the retry happens after the outer transaction rolls back, charging a phantom invoice.
+
+Pick one of three fixes:
+
+1. **Move the enqueue out of the transaction (simplest):**
+   ```ruby
+   invoice = ActiveRecord::Base.transaction { Invoice.create!(user:, amount:) }
+   ChargeInvoiceJob.perform_async(invoice.id)
+   ```
+
+2. **Defer the enqueue to `after_commit`:**
+   ```ruby
+   class Invoice < ApplicationRecord
+     after_commit on: :create do
+       ChargeInvoiceJob.perform_async(id)
+     end
+   end
+   ```
+
+3. **Use a transactional outbox** (e.g. [sidekiq-grouping](https://github.com/gzigzigzeo/sidekiq-grouping), `acidic_job`, or a hand-rolled `outbox_events` table polled by a worker). Required when you need exactly-once-ish semantics across the DB and Redis. Most apps don't need this; the first two suffice.
+
+ActiveJob-on-Sidekiq has the same trap. ActiveJob 7.2+ adds `enqueue_after_transaction_commit` which can be set per-queue-adapter -- enable it globally if your team prefers (3) implicit and (1)/(2) make the lifecycle visible at the call site.
+
+### Uniqueness: prevent duplicate enqueues, not just duplicate work
+
+Idempotency in `perform` makes a job safe to RUN twice. Uniqueness makes it impossible to ENQUEUE the same work twice. The two are independent and complementary.
+
+Use a uniqueness lock when:
+
+- The job is expensive (re-running it wastes minutes, not milliseconds)
+- The user can trigger enqueues faster than the worker can drain them (a UI button, a webhook flood)
+- The work has a natural "subject" (user, order, report) and concurrent runs on the same subject corrupt state
+
+Tools:
+
+- [`sidekiq-unique-jobs`](https://github.com/mhenrixon/sidekiq-unique-jobs) -- the standard library here. Use `lock: :until_executed` for "no duplicate while pending", `lock: :until_and_while_executing` for "no duplicate while pending OR running".
+- A DB unique index on the source intent (preferred when the lock outlives Redis -- e.g. an `outbox_events(unique_key)` index).
+- An application-level `INSERT ... ON CONFLICT DO NOTHING` on a `job_intents` table before enqueueing.
+
+Pick the simplest that covers the failure mode. A unique DB index plus an early-exit guard in `perform` beats a complex Redis-based lock for most cases.
+
+### Queue layout: latency-based, not feature-based
+
+Group queues by SLA, not by domain. Three queues -- `critical`, `default`, `low` -- handles 95% of apps; add a fourth (e.g. `payments`, `mailers`) only when one queue's latency profile is incompatible with the rest.
+
+| Queue | Typical work | Concurrency strategy |
+|-------|--------------|----------------------|
+| `critical` | Auth, billing confirmations, security notifications | Always drained first; size with headroom |
+| `default` | Most async work | Bulk of capacity |
+| `low` | Reports, exports, analytics, cache warming | Throttled or moved to a separate process |
+| (named) | Strictly different SLA (e.g. webhooks with strict ordering) | Isolated workers |
+
+Bad signs: queues named `users_queue`, `posts_queue`, `model_xyz_queue` -- they fragment capacity without a latency justification.
+
+### Concurrency vs throughput
+
+Concurrency is the key risk factor, not total job count: 10 million
+well-behaved jobs draining at low concurrency is fine, while 100 misbehaving
+jobs at high concurrency can take the site down (DB pool exhaustion, external
+API hammering, lock contention). Size concurrency for the worst job on the
+queue, not the average one.
+
+A worker process has `concurrency: N` threads sharing one Ruby VM. Each thread holds:
+
+- A DB connection from the pool (`pool: N` in `database.yml`, or `pool >= N + a few`)
+- A Redis connection
+- Whatever the job grabs (HTTP client, S3 client, etc.)
+
+Common mistakes:
+
+- `concurrency: 25` with `pool: 5` -- 20 threads stall on connection checkout, surfaces as random `ConnectionTimeoutError`
+- `concurrency: 25` for a CPU-bound job that pegs one core -- the other 24 threads compete for the GVL and you lose ~70% throughput vs `concurrency: 5` x 5 processes
+- Mixing IO-bound and CPU-bound jobs on the same process at high concurrency -- the CPU-bound ones starve the IO-bound ones
+
+Match concurrency to the workload, not the marketing number. For IO-bound jobs, 5-10 is usually enough; the bottleneck is downstream (DB, external API), not Ruby.
+
+### Observability is part of the job, not optional
+
+Every job should emit, at minimum:
+
+- `start` / `success` / `failure` events with the job class, jid, args summary (never full args -- args can contain PII)
+- Latency from `enqueued_at` -> `started_at` (queue latency) and `started_at` -> `finished_at` (work latency)
+- The retry count if > 0
+
+Use [`sidekiq` middleware](https://github.com/sidekiq/sidekiq/wiki/Middleware) for cross-cutting instrumentation; don't sprinkle `Rails.logger.info` inside each `perform`.
+
+For Rails 7.1+, prefer the `ActiveSupport::Notifications` instrumentation built into Sidekiq's ActiveJob adapter -- subscribe in one place.
+
+## Testing Jobs
+
+Default to `Sidekiq::Testing.fake!` (the out-of-the-box mode): enqueued jobs
+accumulate in in-memory arrays; assert on them and drain explicitly.
+
+**Never use `Sidekiq::Testing.inline!` in tests.** It runs ALL enqueued jobs —
+including ones enqueued from factories and model callbacks, potentially
+hundreds of unrelated jobs per example. Drain only the workers the test needs:
+
+```ruby
+# Bad
+Sidekiq::Testing.inline! { do_something }
+
+# Good
+Sidekiq::Job.clear_all   # discard jobs enqueued by factories / setup
+do_something
+SomeSpecificWorker.drain # run only the jobs this test is about
+```
+
+Split coverage by layer:
+
+- **Job logic** — call `described_class.new.perform(args)` directly; no
+  Sidekiq machinery involved, no drain needed.
+- **"The caller enqueues the job"** — assert on the enqueue in the caller's
+  test<% if gem?("rspec-sidekiq") %> with `have_enqueued_sidekiq_job` (rspec-sidekiq)<% else %> (`expect { call }.to change(SomeWorker.jobs, :size).by(1)`)<% end %>;
+  don't execute the job there.
+- **Scheduling** — assert on `SomeWorker.jobs.last["at"]`, don't sleep.
+
+## Red Flags
+
+### Idempotency & state
+
+| Pattern | Why | Fix |
+|---------|-----|-----|
+| `perform` body with no early-exit guard | Retry repeats the side effect | Add guards: `return if already_done?`, `return unless record` |
+| `User.find(args[0]).update!(counter: user.counter + 1)` | Lost update under retry / concurrency | `User.where(id: ...).update_all('counter = counter + 1')` or `update_counters` |
+| `record.update_columns(state: "done")` to skip a callback that also enqueues a job | Hides the side effect; downstream consumers stop firing | Fix the callback, not the bypass |
+| `find_or_create_by` without a unique index | Race window between `find` and `create` -- both retries succeed at `create`, one raises | Add the unique index AND rescue `RecordNotUnique` |
+| `Stripe::Charge.create(amount:, customer:)` with no `idempotency_key` | Retried job double-charges | Always pass `idempotency_key: "<deterministic-string>"` to external APIs that support it |
+
+### Transactions & enqueue ordering
+
+| Pattern | Why | Fix |
+|---------|-----|-----|
+| `Job.perform_async(...)` inside an open transaction | Worker may run before COMMIT | Move outside, or use `after_commit`, or enable `enqueue_after_transaction_commit` |
+| `perform_async(...)` inside a `with_lock` block | Same as above plus holds a row lock longer | Capture the work to do, exit the block, then enqueue |
+| Multiple `perform_async` calls in a controller action | Increases latency, fragments retries | Enqueue a single coordinator job that does the fan-out |
+
+### Arguments
+
+| Pattern | Why | Fix |
+|---------|-----|-----|
+| `perform_async(active_record_instance)` | Sidekiq dumps the attributes hash; PII leaks to Redis; data goes stale | Pass `id`, refetch in `perform` |
+| `perform_async(:some_symbol)` | Round-trips as String; `case x when :sym` falls through | Pass strings, or use a constants module |
+| `perform_async(Time.now)` | Zone drift, format drift | Pass epoch integer or ISO8601 String |
+| `perform_async({user_id: 1})` then `args[:user_id]` | Key comes back as `"user_id"`; result is `nil` | Use string keys, or `args.with_indifferent_access` |
+| `perform_async(big_array_of_records)` | Redis bloat; >1 MB job is a smell | Persist + pass id, or `perform_bulk` with per-element jobs |
+
+### Retries
+
+| Pattern | Why | Fix |
+|---------|-----|-----|
+| `sidekiq_options retry: false` on a job that DOES fail transiently | One blip lands the job in the Dead Set forever | Use a small `retry: N` with custom backoff |
+| Custom `rescue => e; retry end` inside `perform` | Bypasses Sidekiq's backoff and observability | Re-raise; let Sidekiq handle it |
+| 25-retry default on a time-sensitive job | Retries for 21 days; the work has been stale for 20 of them | Set `retry: 3` and a custom backoff matching the SLA |
+| Retrying authorization / "record gone" errors | Wastes retries; never recovers | Rescue and return; or configure `sidekiq_retry_in` to `:kill` |
+
+### Concurrency & queue layout
+
+| Pattern | Why | Fix |
+|---------|-----|-----|
+| One queue per model (`posts_queue`, `users_queue`, ...) | Fragments capacity; no SLA differentiation | Collapse to `critical` / `default` / `low` |
+| `concurrency: 25` everywhere | DB pool exhaustion; GVL contention for CPU work | Match concurrency to workload kind |
+| Long-running jobs on the same queue as short jobs | Head-of-line blocking | Move long jobs to a dedicated queue with `-q long,1` weight |
+| `loop { ...; sleep n }` inside a job | Deploys orphan the loop; thread held forever | `sidekiq-cron` or `perform_in` |
+
+### Job kind
+
+| Pattern | Why | Fix |
+|---------|-----|-----|
+| One job loops over 10k records calling external APIs | One failure restarts the whole 10k loop | `perform_bulk` enqueues N child jobs |
+| Job calls `OtherJob.new.perform(...)` inline | Loses retry isolation, observability, and queue routing | `OtherJob.perform_async(...)` |
+| `Job.perform_in(0, ...)` to "defer slightly" | The work runs immediately; this just wastes a Redis round-trip | Either inline the work or `perform_async` |
+| `Sidekiq::Worker` mixed in (old) instead of `Sidekiq::Job` (7.x+) | Old name, identical semantics | Rename to `Sidekiq::Job` |
+
+### Testing
+
+| Pattern | Why | Fix |
+|---------|-----|-----|
+| `Sidekiq::Testing.inline!` | Runs every enqueued job, including factory/callback strays | `clear_all` + drain the specific worker (see Testing Jobs) |
+| Draining all queues to test one flow | Hides which jobs the flow actually enqueues | Drain named workers; assert the rest stayed enqueued |
+| Sleeping to wait for a scheduled job | Wastes wall-clock, still flaky | Assert on the scheduled set / `jobs.last["at"]` |
+
+## Escalation Ladders
+
+### "This job is double-running / I see duplicate side effects"
+
+1. Check if the job is **idempotent** -- does `perform(*same_args)` twice produce the same end state? If not, fix that first; retries are real and rare events will always produce duplicates without idempotency.
+2. Check **uniqueness** -- is the same `(class, args)` enqueued more than once? Inspect with `Sidekiq::Queue.new("default").select { |j| j.klass == "..." }`. If yes, add a uniqueness lock or a `job_intents` unique index.
+3. Check **transactional ordering** -- is the enqueue inside a transaction that may roll back? Move it out or use `after_commit`.
+4. Check for **multiple producers** -- a callback AND a service AND a controller all enqueuing the same job is a common cause.
+
+### "This job is silently not running"
+
+1. Inspect the queue: `Sidekiq::Queue.new("queue_name").size`.
+2. Inspect the retry set: `Sidekiq::RetrySet.new.select { |j| j.klass == "..." }` -- often the job is failing and you don't see logs.
+3. Inspect the dead set: `Sidekiq::DeadSet.new.select { |j| ... }` -- 25 silent retries land here.
+4. Inspect the scheduled set: `Sidekiq::ScheduledSet.new` -- `perform_in` lives here.
+5. Confirm the worker process is consuming the right queues: `sidekiq -q critical -q default -q low` order matters (left-to-right priority).
+
+### "This job is too slow / queue is backing up"
+
+1. **Profile one example**: time `perform` for a representative arg set. If `perform` itself is slow, the queue backup is downstream of the worker.
+2. **Check N+1**: most "slow Sidekiq" is "slow ActiveRecord". Add `bullet` or `prosopite` in dev; eager-load.
+3. **Check external API latency**: a 2s API call * 10k jobs = 5.5 hours single-threaded. Either parallelize (`perform_bulk` + concurrency) or batch the API calls.
+4. **Check concurrency vs. pool**: `concurrency: 25` with `pool: 5` stalls 20 threads on DB checkout.
+5. **Check queue weights**: `sidekiq -q critical,4 -q default,2 -q low,1` -- without weights, all queues are equal and `low` starves `critical`.
+6. **Last resort: split processes**. Move `low` to its own dyno/pod with separate concurrency tuning so `critical` is never starved.
+
+### "How do I cancel a scheduled job?"
+
+Sidekiq does not give jids a real cancel API. Patterns:
+
+1. **Source-of-truth check inside `perform`**: store the intent on a record (`reminder_scheduled_for`), and `return` from `perform` if `reminder_scheduled_for != args[1]` (i.e. it was rescheduled or cancelled). This is the canonical pattern.
+2. **Manual scheduled-set removal**: `Sidekiq::ScheduledSet.new.find { |j| j.jid == jid }&.delete` -- works but the jid is the only handle; keep it on the source record.
+
+Never delete the job from the queue while it might already be running.

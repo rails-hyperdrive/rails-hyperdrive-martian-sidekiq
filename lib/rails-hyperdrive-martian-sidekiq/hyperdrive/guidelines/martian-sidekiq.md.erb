@@ -1,0 +1,27 @@
+---
+name: martian-sidekiq
+description: Non-negotiable Sidekiq rules — testing, arguments, transactions, concurrency.
+---
+
+### Sidekiq & Background Jobs
+
+- **Never use `Sidekiq::Testing.inline!` in tests.** It runs ALL enqueued jobs,
+  including ones from factories and callbacks. Instead: `Sidekiq::Job.clear_all`,
+  run the code, then `SpecificWorker.drain`.
+- **Keep job arguments small (< 1 KB) and primitive.** Pass IDs, refetch in
+  `perform`; never AR objects, symbols, or Time objects.
+- **Never enqueue inside an open DB transaction.** The worker can run before
+  the COMMIT (or after a ROLLBACK). Enqueue after the transaction or from
+  `after_commit`.
+- **Every job must be idempotent.** Retries are at-least-once; start `perform`
+  with early-exit guards.
+- **Concurrency is the risk factor, not job count.** Millions of well-behaved
+  jobs at low concurrency are fine; 100 misbehaving jobs at high concurrency
+  can take the site down.
+- **For rate-limited work, smear the schedule** (`perform_in` / `push_bulk`
+  with `at:`)<% if gem?("sidekiq-ent") %> and combine it with `Sidekiq::Limiter` for fine-grained
+  concurrency control — neither alone is sufficient<% else %> and back off on 429s via `sidekiq_retry_in` — neither
+  alone is sufficient<% end %>.
+
+The `martian-sidekiq` skill has the full playbook (idempotency strategies,
+retry design, uniqueness, queue layout, escalation ladders).

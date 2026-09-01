@@ -1,0 +1,4 @@
+# Default gate for every artifact this companion ships (skill, command,
+# guideline): install only when the app's bundle has a compatible Sidekiq.
+gems:
+  - sidekiq: ">= 7.0, < 9.0"
