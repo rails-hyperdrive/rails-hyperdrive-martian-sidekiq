@@ -46,7 +46,7 @@ If a job's `perform` body has >3 conditional branches that ALSO trigger external
 
 | Situation | Action |
 |-----------|--------|
-| `after_commit` callback enqueues a job from a model | Acceptable for low-coupling notifications; risky when the model is created in many flows -- prefer enqueuing from the service that owns the use case |
+| `after_commit` callback enqueues a job from a model | Acceptable for low-coupling notifications; risky when the model is created in many flows -- prefer enqueuing from the service that owns the use case<% if !gem?("after_commit_everywhere") %> (`after_commit_everywhere` makes that possible without a model callback)<% end %> |
 | Controller enqueues 5 jobs in a row | Move to a single coordinator job + `perform_bulk` so the request returns fast and retries are unified |
 | Caller awaits the result of a job | Wrong shape -- either do the work synchronously or return a "processing" state and let the client poll |
 | Job calls another job's `.new.perform` inline | Loses retry isolation; either inline the logic OR enqueue with `perform_async` |
@@ -234,7 +234,7 @@ end
 
 Sidekiq runs in Redis; your DB transaction has not yet committed. The worker picks up the job within milliseconds and finds `Invoice.find_by(id: ...)` returns `nil`. On retry the record exists; on bad luck the retry happens after the outer transaction rolls back, charging a phantom invoice.
 
-Pick one of three fixes:
+Pick one of four fixes, in increasing order of machinery:
 
 1. **Move the enqueue out of the transaction (simplest):**
    ```ruby
@@ -251,9 +251,47 @@ Pick one of three fixes:
    end
    ```
 
-3. **Use a transactional outbox** (e.g. [sidekiq-grouping](https://github.com/gzigzigzeo/sidekiq-grouping), `acidic_job`, or a hand-rolled `outbox_events` table polled by a worker). Required when you need exactly-once-ish semantics across the DB and Redis. Most apps don't need this; the first two suffice.
+3. **Defer the enqueue to `after_commit` from the service that owns the use
+   case** — the shape you want when the enqueue is part of a use case rather
+   than a property of the model, and the one that survives a caller wrapping
+   your service in an outer transaction:
+<%- if gem?("after_commit_everywhere") -%>
 
-ActiveJob-on-Sidekiq has the same trap. ActiveJob 7.2+ adds `enqueue_after_transaction_commit` which can be set per-queue-adapter -- enable it globally if your team prefers (3) implicit and (1)/(2) make the lifecycle visible at the call site.
+   This project has
+   [after_commit_everywhere](https://github.com/Envek/after_commit_everywhere):
+
+   ```ruby
+   class ChargeInvoice
+     include AfterCommitEverywhere
+
+     def call(user:, amount:)
+       invoice = Invoice.create!(user:, amount:)
+       after_commit { ChargeInvoiceJob.perform_async(invoice.id) }
+       invoice
+     end
+   end
+   ```
+
+   Outside a transaction the block runs immediately, so the service behaves
+   correctly whether or not a caller wrapped it — that is the point of using
+   it over a hand-rolled `connection.current_transaction` check. Don't call
+   the methods on an AR model directly; that registers the callback on every
+   instance, including future ones.
+<%- else -%>
+
+   Rails only offers `after_commit` as a model callback, so the plain version
+   of this means pushing a use-case concern down into the model. When that
+   tension shows up, propose
+   [after_commit_everywhere](https://github.com/Envek/after_commit_everywhere)
+   to the user — it makes `after_commit` / `after_rollback` callable from
+   service objects, and running outside a transaction simply executes the
+   block immediately, so the service stays correct whether or not a caller
+   wrapped it. Propose the dependency; don't add it silently.
+<%- end -%>
+
+4. **Use a transactional outbox** (e.g. [sidekiq-grouping](https://github.com/gzigzigzeo/sidekiq-grouping), `acidic_job`, or a hand-rolled `outbox_events` table polled by a worker). Required when you need exactly-once-ish semantics across the DB and Redis. Most apps don't need this; the first three suffice.
+
+ActiveJob-on-Sidekiq has the same trap. ActiveJob 7.2+ adds `enqueue_after_transaction_commit`, which can be set per-queue-adapter and defers every enqueue automatically -- enable it globally if your team prefers the guarantee implicit; the explicit fixes above keep the lifecycle visible at the call site.
 
 ### Uniqueness: prevent duplicate enqueues, not just duplicate work
 
