@@ -265,13 +265,41 @@ Use a uniqueness lock when:
 - The user can trigger enqueues faster than the worker can drain them (a UI button, a webhook flood)
 - The work has a natural "subject" (user, order, report) and concurrent runs on the same subject corrupt state
 
-Tools:
+Reach for the DB first — it is the option with the fewest moving parts:
 
-- [`sidekiq-unique-jobs`](https://github.com/mhenrixon/sidekiq-unique-jobs) -- the standard library here. Use `lock: :until_executed` for "no duplicate while pending", `lock: :until_and_while_executing` for "no duplicate while pending OR running".
-- A DB unique index on the source intent (preferred when the lock outlives Redis -- e.g. an `outbox_events(unique_key)` index).
+- A DB unique index on the source intent, preferred whenever the lock must outlive Redis (e.g. an `outbox_events(unique_key)` index). A lock that vanishes with a Redis flush was never a guarantee.
 - An application-level `INSERT ... ON CONFLICT DO NOTHING` on a `job_intents` table before enqueueing.
 
-Pick the simplest that covers the failure mode. A unique DB index plus an early-exit guard in `perform` beats a complex Redis-based lock for most cases.
+A unique DB index plus an early-exit guard in `perform` beats a Redis-based lock for most cases: it survives Redis loss, it is visible in schema, and it needs no extra dependency.
+<%- if gem?("sidekiq-unique-jobs") -%>
+
+When the lock genuinely belongs in Redis, this project already has
+[`sidekiq-unique-jobs`](https://github.com/mhenrixon/sidekiq-unique-jobs).
+Use `lock: :until_executed` for "no duplicate while pending", and
+`lock: :until_and_while_executing` for "no duplicate while pending OR
+running". Always pair a lock with `lock_timeout` / `lock_ttl` — an
+orphaned lock (worker killed mid-job) otherwise blocks that subject
+indefinitely.
+<%- if gem?("sidekiq-ent") -%>
+
+Note that Sidekiq Enterprise (also in this bundle) ships uniqueness built in
+via `sidekiq_options unique_for: 10.minutes`. For new jobs prefer it over the
+gem — one less locking layer to reason about.
+<%- end -%>
+<%- elsif gem?("sidekiq-ent") -%>
+
+This project has Sidekiq Enterprise, which ships uniqueness built in — use
+`sidekiq_options unique_for: 10.minutes` rather than adding a third-party
+locking gem on top of it.
+<%- else -%>
+
+When neither DB option fits and the lock genuinely belongs in Redis, propose
+[`sidekiq-unique-jobs`](https://github.com/mhenrixon/sidekiq-unique-jobs) to
+the user — it is the de-facto standard for uniqueness locks on OSS Sidekiq
+(uniqueness itself is an Enterprise feature). Propose the dependency; don't
+add it silently, and check the version constraint first: current releases
+require Sidekiq >= 8, so a Sidekiq 7.x app needs the gem's 8.x line.
+<%- end -%>
 
 ### Queue layout: latency-based, not feature-based
 
