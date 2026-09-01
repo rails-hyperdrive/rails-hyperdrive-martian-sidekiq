@@ -13,6 +13,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   multi-tenant fair scheduling, testing, escalation ladders. Conditional
   sections for Sidekiq Pro/Enterprise, sidekiq-fair_tenant, and rspec-sidekiq.
 - `martian-sidekiq` guideline with the non-negotiable Sidekiq rules.
+- `martian-sidekiq-transactions` guideline covering service-level enqueues
+  with `after_commit_everywhere`; installed only when that gem is bundled.
 - `hyperdrive.yml` manifest gating all artifacts on `sidekiq >= 7.0, < 9.0`.
 
 [Unreleased]: https://github.com/rails-hyperdrive/rails-hyperdrive-martian-sidekiq/compare/HEAD...HEAD
