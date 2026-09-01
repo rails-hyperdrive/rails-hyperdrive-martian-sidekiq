@@ -5,9 +5,14 @@ gems:
 
 guidelines:
   # A per-entry gate REPLACES the default one above, so Sidekiq must be
-  # re-stated here: this guideline is only useful when the app has both.
+  # re-stated in each: these are only useful when the app has both gems.
   martian-sidekiq-transactions.md:
     gems:
       all:
         - sidekiq: ">= 7.0, < 9.0"
         - after_commit_everywhere
+  martian-sidekiq-fair-tenant.md:
+    gems:
+      all:
+        - sidekiq: ">= 7.0, < 9.0"
+        - sidekiq-fair_tenant
