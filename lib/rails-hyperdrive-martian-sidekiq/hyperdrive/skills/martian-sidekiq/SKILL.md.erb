@@ -259,24 +259,14 @@ Pick one of four fixes, in increasing order of machinery:
 
    This project has
    [after_commit_everywhere](https://github.com/Envek/after_commit_everywhere):
+   `include AfterCommitEverywhere` in the service and wrap the enqueue in
+   `after_commit { ... }`. Outside a transaction the block runs immediately,
+   so the service stays correct whether or not a caller wrapped it.
 
-   ```ruby
-   class ChargeInvoice
-     include AfterCommitEverywhere
-
-     def call(user:, amount:)
-       invoice = Invoice.create!(user:, amount:)
-       after_commit { ChargeInvoiceJob.perform_async(invoice.id) }
-       invoice
-     end
-   end
-   ```
-
-   Outside a transaction the block runs immediately, so the service behaves
-   correctly whether or not a caller wrapped it — that is the point of using
-   it over a hand-rolled `connection.current_transaction` check. Don't call
-   the methods on an AR model directly; that registers the callback on every
-   instance, including future ones.
+   The worked example and the two footguns (never register the callbacks on
+   an AR model; `after_rollback` raises outside a transaction) are in the
+   `martian-sidekiq-transactions` guideline, already in your context — follow
+   it rather than re-deriving the shape here.
 <%- else -%>
 
    Rails only offers `after_commit` as a model callback, so the plain version
@@ -397,30 +387,15 @@ overflow to lower-weight "throttled" queues so other tenants' jobs keep
 flowing. Don't hand-roll this with one-queue-per-tenant or in-job sleeps.
 <%- if gem?("sidekiq-fair_tenant") -%>
 
-This project uses [sidekiq-fair_tenant](https://github.com/Envek/sidekiq-fair_tenant).
-Declare re-routing rules on the job and tell it who the tenant is:
+This project uses [sidekiq-fair_tenant](https://github.com/Envek/sidekiq-fair_tenant):
+declare `fair_tenant_queues:` rules on the jobs one tenant can trigger in
+bulk, and give each rule a throttled queue that exists in the Sidekiq config
+with a lower weight.
 
-```ruby
-class SomeJob
-  include Sidekiq::Job
-  sidekiq_options queue: "default",
-    fair_tenant_queues: [
-      { queue: "throttled_2x", threshold: 100, per: 1.hour },
-      { queue: "throttled_4x", threshold: 10,  per: 1.minute }
-    ]
-
-  # Or enqueue with SomeJob.set(fair_tenant: "...").perform_async(...)
-  def self.fair_tenant(*perform_args)
-    perform_args.first # e.g. the account id
-  end
-end
-```
-
-Enqueues are tracked per tenant in a sliding Redis window; rules are checked
-in order and the last matching one wins. The throttled queues MUST be listed
-with lower weights in the Sidekiq config (`[default, 4]`, `[throttled_2x, 2]`,
-`[throttled_4x, 1]`) — re-routing into a queue nobody drains is a silent
-black hole.
+The rule syntax, tenant resolution, ordering semantics (the LAST matching rule
+wins), and the silent-black-hole failure when a throttled queue is missing
+from the config are all in the `martian-sidekiq-fair-tenant` guideline,
+already in your context — follow it rather than re-deriving the shape here.
 <%- else -%>
 
 This project does not use
