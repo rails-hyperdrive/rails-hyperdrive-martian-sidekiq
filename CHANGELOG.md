@@ -12,8 +12,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   transactional enqueues, queue layout, rate limiting, bulk enqueueing,
   multi-tenant fair scheduling, testing, escalation ladders. Conditional
   sections for Sidekiq Pro/Enterprise, sidekiq-fair_tenant, and rspec-sidekiq.
-- `/generate-sidekiq-worker` command: scaffolds a worker + spec following the
-  project's own conventions; conditional Sorbet/tapioca and packwerk support.
 - `martian-sidekiq` guideline with the non-negotiable Sidekiq rules.
 - `hyperdrive.yml` manifest gating all artifacts on `sidekiq >= 7.0, < 9.0`.
 

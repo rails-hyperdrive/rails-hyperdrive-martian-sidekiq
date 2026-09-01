@@ -10,8 +10,8 @@ Gem::Specification.new do |spec|
   spec.description = <<~DESC
     Companion gem for rails-hyperdrive. Ships the `martian-sidekiq` skill — a procedural,
     model-invoked guide for writing idempotent, well-retried Sidekiq jobs in Rails
-    projects — plus a `/generate-sidekiq-worker` command and an always-on guideline
-    with the non-negotiable Sidekiq rules. Installed by `bin/rails hyperdrive:init`.
+    projects — plus an always-on guideline with the non-negotiable Sidekiq rules.
+    Installed by `bin/rails hyperdrive:init`.
   DESC
   spec.homepage    = "https://github.com/rails-hyperdrive/rails-hyperdrive-martian-sidekiq"
   spec.license     = "MIT"
@@ -25,11 +25,10 @@ Gem::Specification.new do |spec|
 
   # rails-hyperdrive discovery hints (pre-install; read remotely from rubygems).
   spec.metadata["hyperdrive_targets"]    = "sidekiq"
-  spec.metadata["hyperdrive_artifacts"]  = "skill,command,guideline"
+  spec.metadata["hyperdrive_artifacts"]  = "skill,guideline"
 
   spec.files = Dir[
     "lib/**/*",
-    "commands/**/*",
     "hyperdrive.yml",
     "LICENSE.txt",
     "README.md",
