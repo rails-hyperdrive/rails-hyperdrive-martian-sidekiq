@@ -1,6 +1,6 @@
 ---
 name: martian-sidekiq
-description: "Writing and reviewing Sidekiq jobs in Rails projects. Use when (1) creating new worker/job classes, (2) reviewing job code for retry, idempotency, or transactional bugs, (3) debugging duplicated/lost/stuck jobs, (4) tuning queue layout, concurrency, or backpressure, (5) writing or fixing tests that enqueue, drain, or assert on jobs. MUST use when working with `perform_async`, `perform_in`, `perform_bulk`, `sidekiq_options`, `retry`, `sidekiq-cron`, `sidekiq-unique-jobs`, `Sidekiq::Testing`, or transactional enqueues. Covers: Sidekiq, ActiveJob-on-Sidekiq, idempotency, retries, uniqueness, batching, rate limiting, transactional outbox, queue layout, testing, observability."
+description: "Writing and reviewing Sidekiq jobs in Rails projects. Use when (1) creating new worker/job classes, (2) reviewing job code for retry, idempotency, or transactional bugs, (3) debugging duplicated/lost/stuck jobs, (4) tuning queue layout, concurrency, or backpressure, (5) writing or fixing tests that enqueue, drain, or assert on jobs. MUST use when working with `perform_async`, `perform_in`, `perform_bulk`, `sidekiq_options`, `retry`, `sidekiq-cron`, `sidekiq-unique-jobs`, `sidekiq-fair_tenant`, `Sidekiq::Testing`, or transactional enqueues. Covers: Sidekiq, ActiveJob-on-Sidekiq, idempotency, retries, uniqueness, batching, rate limiting, multi-tenant fairness / noisy neighbors, transactional outbox, queue layout, testing, observability."
 ---
 
 # Sidekiq for Rails
@@ -286,6 +286,52 @@ Group queues by SLA, not by domain. Three queues -- `critical`, `default`, `low`
 
 Bad signs: queues named `users_queue`, `posts_queue`, `model_xyz_queue` -- they fragment capacity without a latency justification.
 
+### Fair scheduling between tenants (noisy neighbors)
+
+In a multi-tenant app, one tenant bulk-triggering thousands of jobs starves
+everyone else on the same queue: capacity is fine, ordering is not. The fix is
+fairness, not more workers — once a tenant exceeds a threshold, route their
+overflow to lower-weight "throttled" queues so other tenants' jobs keep
+flowing. Don't hand-roll this with one-queue-per-tenant or in-job sleeps.
+<%- if gem?("sidekiq-fair_tenant") -%>
+
+This project uses [sidekiq-fair_tenant](https://github.com/Envek/sidekiq-fair_tenant).
+Declare re-routing rules on the job and tell it who the tenant is:
+
+```ruby
+class SomeJob
+  include Sidekiq::Job
+  sidekiq_options queue: "default",
+    fair_tenant_queues: [
+      { queue: "throttled_2x", threshold: 100, per: 1.hour },
+      { queue: "throttled_4x", threshold: 10,  per: 1.minute }
+    ]
+
+  # Or enqueue with SomeJob.set(fair_tenant: "...").perform_async(...)
+  def self.fair_tenant(*perform_args)
+    perform_args.first # e.g. the account id
+  end
+end
+```
+
+Enqueues are tracked per tenant in a sliding Redis window; rules are checked
+in order and the last matching one wins. The throttled queues MUST be listed
+with lower weights in the Sidekiq config (`[default, 4]`, `[throttled_2x, 2]`,
+`[throttled_4x, 1]`) — re-routing into a queue nobody drains is a silent
+black hole.
+<%- else -%>
+
+This project does not use
+[sidekiq-fair_tenant](https://github.com/Envek/sidekiq-fair_tenant). When a
+noisy-neighbor problem shows up, suggest it to the user — it works with plain
+Sidekiq (no Pro/Enterprise): jobs declare `fair_tenant_queues:` rules
+(`{ queue:, threshold:, per: }`), enqueues are counted per tenant in a sliding
+Redis window, and a tenant over the threshold gets re-routed to lower-weight
+throttled queues. Propose the dependency — don't add it silently. If the user
+agrees: `bundle add sidekiq-fair_tenant`, add rules to the heavy jobs, and
+list the throttled queues with lower weights in the Sidekiq config.
+<%- end -%>
+
 ### Concurrency vs throughput
 
 Concurrency is the key risk factor, not total job count: 10 million
@@ -437,7 +483,8 @@ Split coverage by layer:
 3. **Check external API latency**: a 2s API call * 10k jobs = 5.5 hours single-threaded. Either parallelize (`perform_bulk` + concurrency) or batch the API calls.
 4. **Check concurrency vs. pool**: `concurrency: 25` with `pool: 5` stalls 20 threads on DB checkout.
 5. **Check queue weights**: `sidekiq -q critical,4 -q default,2 -q low,1` -- without weights, all queues are equal and `low` starves `critical`.
-6. **Last resort: split processes**. Move `low` to its own dyno/pod with separate concurrency tuning so `critical` is never starved.
+6. **Check for a noisy tenant**: if most queued jobs belong to one account, capacity is fine — fairness isn't. Re-route that tenant's overflow to throttled lower-weight queues (see Fair scheduling between tenants).
+7. **Last resort: split processes**. Move `low` to its own dyno/pod with separate concurrency tuning so `critical` is never starved.
 
 ### "How do I cancel a scheduled job?"
 
